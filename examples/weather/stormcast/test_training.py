@@ -24,12 +24,6 @@ from omegaconf import DictConfig
 import pytest
 import torch
 from torch.distributed.checkpoint.state_dict import get_state_dict, StateDictOptions
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import (
-    StateDictType,
-    ShardedStateDictConfig,
-    ShardedOptimStateDictConfig,
-)
 from torch.distributed.tensor import DTensor
 
 from physicsnemo.distributed import DistributedManager
