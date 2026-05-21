@@ -47,7 +47,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     set_optimizer_state_dict,
 )
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import FSDPModule, FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.optim.lr_scheduler import LRScheduler
@@ -94,10 +94,33 @@ def _unwrap_ddp_compile(
 
 
 def _unwrap_fsdp(model: torch.nn.Module) -> torch.nn.Module:
-    """Unwrap one FSDP layer (if present) to reach the user module."""
+    """Unwrap one FSDP layer (if present) to reach the user module.
+
+    For FSDP1 this returns ``model.module`` (the user module inside the
+    ``FullyShardedDataParallel`` wrapper).  For FSDP2 the user module IS the
+    same object — ``fully_shard`` mutates its ``__class__`` in place — so
+    nothing to unwrap; callers that need the *original* class name should use
+    :func:`_unwrapped_class_name` rather than ``type(...).__name__``.
+    """
     if isinstance(model, FSDP):
         return model.module
     return model
+
+
+def _unwrapped_class_name(model: torch.nn.Module) -> str:
+    """Return the user-facing class name, peeling FSDP1/FSDP2 wrappers.
+
+    FSDP2's ``fully_shard`` rebinds ``model.__class__`` to a dynamically
+    generated ``FSDP{ClassName}`` subclass with bases ``(FSDPModule, original_cls)``.
+    Stripping the prefix isn't reliable because user classes may legitimately
+    start with ``FSDP``; instead we read ``__bases__[1]`` directly.
+    """
+    inner = _unwrap_fsdp(model)
+    if isinstance(inner, FSDPModule):
+        bases = type(inner).__bases__
+        if len(bases) >= 2 and bases[0] is FSDPModule:
+            return bases[1].__name__
+    return type(inner).__name__
 
 
 def _cpu_offload_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -165,16 +188,38 @@ def _has_non_fsdp_dtensors(
     model: torch.nn.Module,
     dtensor_plc: dict[str, tuple[Any, tuple[Any, ...]]],
 ) -> bool:
-    """Return ``True`` when *dtensor_plc* contains placements not managed by FSDP.
+    """Return ``True`` when *dtensor_plc* requires the manual broadcast path.
 
-    FSDP with ``FULL_SHARD`` or ``SHARD_GRAD_OP`` wraps parameters as
-    DTensors on its own mesh.  ``broadcast_from_rank0`` handles these
-    natively, so manual redistribution should be skipped.  Only
-    user-created DTensors (e.g. ShardTensor on a separate domain mesh)
-    require explicit redistribution.
+    The function answers a single operational question: does loading this
+    model's state dict need to bypass DCP's ``broadcast_from_rank0`` in
+    favour of the explicit ``broadcast_object_list`` /
+    ``_redistribute_sd_for_dtensor`` path?  The answer is ``True`` for:
+
+    * Plain (non-FSDP) modules holding DTensors (e.g. user-created ShardTensors
+      on a domain mesh) — DCP's broadcast cannot rebuild user placements.
+    * ``FSDP`` (FSDP1) with ``NO_SHARD`` — equivalent to plain DDP, no
+      FSDP-managed DTensors to be aware of.
+    * ``FSDPModule`` (FSDP2) whose parameters sit on a mesh with any
+      *degenerate* dimension (``size == 1``).  In that case DCP's underlying
+      ``dist.broadcast`` raises
+      ``RuntimeError: found no DeviceMesh from dtensor args for c10d::broadcast_``
+      because c10d cannot dispatch through a size-1 mesh axis.  The same
+      configuration also breaks DCP's optimizer load with
+      ``KeyError: 'state.0.step'`` (the freshly-constructed live optimizer has
+      no materialised ``state``, so DCP's flatten-mapping is missing the
+      checkpoint's ``state.X.step`` keys).  Both surface when ``fully_shard``
+      runs on world_size == 1, or on a 2D mesh whose ``ddp`` axis collapses
+      to 1 (e.g. ``(ddp=1, domain=N)`` after batch_size==1 on N ranks).
+      The manual path sidesteps both — it broadcasts the dict as Python
+      objects and then sets state with ``options=full_options`` (no DCP
+      broadcast, no unflatten round-trip).
     """
     if not dtensor_plc:
         return False
+    if isinstance(model, FSDPModule):
+        return any(
+            any(s == 1 for s in mesh.shape) for mesh, _ in dtensor_plc.values()
+        )
     if not isinstance(model, FSDP):
         return True
     if model.sharding_strategy == ShardingStrategy.NO_SHARD:
@@ -603,7 +648,7 @@ def _unique_model_names(
     model_dict: dict[str, list[torch.nn.Module]] = {}
     for model0 in models:
         model0 = _unwrap_ddp_compile(model0, loading=loading)
-        base_name = type(_unwrap_fsdp(model0)).__name__
+        base_name = _unwrapped_class_name(model0)
         if base_name in model_dict:
             model_dict[base_name].append(model0)
         else:
