@@ -260,18 +260,6 @@ class ParallelHelper:
                 device_mesh=self.mesh["domain"],
                 partition_fn=partition_model_selective,
             )
-        # FSDP2 rejects non-contiguous parameters (PyTorch <= 2.10):
-        #   NotImplementedError: FSDP does not support non-contiguous parameters
-        # Models created with ``.to(memory_format=torch.channels_last)`` have
-        # 4D params with channels_last strides.  Force standard contiguity on
-        # the parameter storage — kernels still convert activations to
-        # channels_last when inputs arrive in that layout, so the perf win is
-        # retained.
-        with torch.no_grad():
-            for p in model.parameters():
-                if p.is_contiguous():
-                    continue
-                p.data = p.data.contiguous()
         fully_shard(model, mesh=self.mesh["ddp"])
         return model
 
