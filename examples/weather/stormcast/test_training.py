@@ -586,3 +586,57 @@ def test_model_types(
             rundir, "checkpoints_diffusion", "EDMPreconditioner.0.10.mdlus"
         )
         assert os.path.isfile(ckpt_path), "Diffusion checkpoint not found"
+
+
+@pytest.mark.timeout(30)
+def test_contiguity_channels_last():
+    """Verify the FSDP2 contiguity workaround preserves channels-last activation path.
+
+    FSDP2 rejects non-contiguous parameters, so distribute_model forces
+    standard contiguity on parameter storage before calling fully_shard.
+    This test ensures:
+      1. After the fix, all parameters are standard-contiguous.
+      2. A channels-last input still produces channels-last output
+         activations (cuDNN fast path is retained).
+    """
+    model = torch.nn.Sequential(
+        torch.nn.Conv2d(3, 16, kernel_size=3, padding=1),
+        torch.nn.BatchNorm2d(16),
+        torch.nn.ReLU(),
+        torch.nn.Conv2d(16, 32, kernel_size=3, padding=1),
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    model = model.to(memory_format=torch.channels_last)
+
+    # Confirm params are now channels_last (non-contiguous in default sense)
+    conv_params_4d = [p for p in model.parameters() if p.dim() == 4]
+    assert len(conv_params_4d) > 0
+    assert any(not p.is_contiguous() for p in conv_params_4d), (
+        "Expected non-contiguous (channels_last) params before the fix"
+    )
+
+    # Apply the same contiguity fix used in distribute_model
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.is_contiguous():
+                continue
+            p.data = p.data.contiguous()
+
+    # 1. All parameters must now be standard-contiguous
+    for name, p in model.named_parameters():
+        assert p.is_contiguous(), (
+            f"Parameter {name} is not contiguous after the fix"
+        )
+
+    # 2. Channels-last input should still produce channels-last output
+    x = torch.randn(2, 3, 16, 16, device=device).to(memory_format=torch.channels_last)
+    assert x.is_contiguous(memory_format=torch.channels_last)
+
+    with torch.no_grad():
+        y = model(x)
+
+    assert y.is_contiguous(memory_format=torch.channels_last), (
+        "Output activations lost channels_last layout — cuDNN fast path is broken"
+    )
