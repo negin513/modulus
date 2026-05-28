@@ -14,22 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import nullcontext
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Literal
 
-from hydra import compose, initialize
-from omegaconf import DictConfig
 import pytest
 import torch
-from torch.distributed.checkpoint.state_dict import get_state_dict, StateDictOptions
+import train
+from hydra import compose, initialize
+from omegaconf import DictConfig
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
 from torch.distributed.tensor import DTensor
+from utils import trainer
 
 from physicsnemo.distributed import DistributedManager
-
-import train
-from utils import trainer
 
 DistributedManager.initialize()
 
@@ -626,9 +625,7 @@ def test_contiguity_channels_last():
 
     # 1. All parameters must now be standard-contiguous
     for name, p in model.named_parameters():
-        assert p.is_contiguous(), (
-            f"Parameter {name} is not contiguous after the fix"
-        )
+        assert p.is_contiguous(), f"Parameter {name} is not contiguous after the fix"
 
     # 2. Channels-last input should still produce channels-last output
     x = torch.randn(2, 3, 16, 16, device=device).to(memory_format=torch.channels_last)
