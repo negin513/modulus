@@ -16,21 +16,20 @@
 
 """Domain parallelization utilities."""
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 import numpy as np
 import torch
+from datasets.dataset import worker_init
 from torch.distributed.fsdp import FSDPModule, fully_shard
 from torch.distributed.tensor import DTensor, distribute_module, distribute_tensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
+from utils.nn import nested_to
 
+from physicsnemo.diffusion.noise_schedulers import DomainParallelNoiseScheduler
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.domain_parallel.shard_tensor import ShardTensor, scatter_tensor
-from physicsnemo.diffusion.noise_schedulers import DomainParallelNoiseScheduler
-
-from datasets.dataset import worker_init
-from utils.nn import nested_to
 
 
 class ParallelHelper:
@@ -260,6 +259,20 @@ class ParallelHelper:
                 device_mesh=self.mesh["domain"],
                 partition_fn=partition_model_selective,
             )
+        # FSDP2 rejects non-contiguous parameters with
+        #   NotImplementedError: FSDP does not support non-contiguous parameters
+        # raised from torch.distributed.fsdp._fully_shard._fsdp_param.
+        # Models created with ``.to(memory_format=torch.channels_last)`` have
+        # 4D conv params with channels_last strides (e.g. shape (32, 12, 4, 4)
+        # with stride (192, 1, 48, 12) -- DiT's patch-embed conv is one
+        # example).  Force standard contiguity on the parameter storage;
+        # kernels still convert activations to channels_last when inputs
+        # arrive in that layout, so the perf win is retained.
+        with torch.no_grad():
+            for p in model.parameters():
+                if p.is_contiguous():
+                    continue
+                p.data = p.data.contiguous()
         fully_shard(model, mesh=self.mesh["ddp"])
         return model
 
