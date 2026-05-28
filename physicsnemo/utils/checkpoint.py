@@ -113,7 +113,8 @@ def _unwrapped_class_name(model: torch.nn.Module) -> str:
     FSDP2's ``fully_shard`` rebinds ``model.__class__`` to a dynamically
     generated ``FSDP{ClassName}`` subclass with bases ``(FSDPModule, original_cls)``.
     Stripping the prefix isn't reliable because user classes may legitimately
-    start with ``FSDP``; instead we read ``__bases__[1]`` directly.
+    start with ``FSDP``; instead we walk the MRO and return the first class
+    that is not ``FSDPModule`` and not a generic ``torch.nn.Module`` base.
 
     Without this fix, saving an FSDP2-wrapped model produces a ``.mdlus``
     file named after the synthetic class (e.g. ``FSDPFullyConnected.mdlus``)
@@ -121,9 +122,10 @@ def _unwrapped_class_name(model: torch.nn.Module) -> str:
     """
     inner = _unwrap_fsdp(model)
     if isinstance(inner, FSDPModule):
-        bases = type(inner).__bases__
-        if len(bases) >= 2 and bases[0] is FSDPModule:
-            return bases[1].__name__
+        _SKIP = (FSDPModule, torch.nn.Module, object)
+        for cls in type(inner).__mro__:
+            if cls not in _SKIP:
+                return cls.__name__
     return type(inner).__name__
 
 
