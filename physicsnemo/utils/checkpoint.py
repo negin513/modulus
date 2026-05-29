@@ -1456,6 +1456,17 @@ def _load_checkpoint_distributed(
                 torch.distributed.broadcast_object_list(sd_list, src=0)
                 sd = _redistribute_sd_for_dtensor(dtensor_plc, sd_list[0])
                 set_model_state_dict(model, sd, options=full_options)
+            elif isinstance(model, FSDPModule):
+                # FSDP2 (fully_shard): DCP's broadcast_from_rank0 can hang
+                # for FSDPModule on multi-rank meshes.  Broadcast the full
+                # state dict explicitly and let DCP handle the DTensor
+                # sharding locally on each rank via full_state_dict=True.
+                sd_list = [
+                    model_state_dicts.get(name, {}) if is_rank0 else {}
+                ]
+                torch.distributed.broadcast_object_list(sd_list, src=0)
+                sd = _force_standard_contiguous(sd_list[0])
+                set_model_state_dict(model, sd, options=full_options)
             else:
                 # FSDP-managed DTensors (FULL_SHARD/SHARD_GRAD_OP) or no
                 # DTensors at all — broadcast_from_rank0 handles both. Force
@@ -1532,6 +1543,20 @@ def _load_checkpoint_distributed(
                 # ``KeyError: 'state.0.step'`` inside DCP's
                 # ``_unflatten_state_dict``.  The placeholders are
                 # overwritten by the following ``set_optimizer_state_dict``.
+                _materialize_optimizer_state_for_dcp(
+                    optimizer, optim_sd.get("state", {})
+                )
+                set_optimizer_state_dict(
+                    opt_model, optimizer, optim_sd, options=full_options
+                )
+            elif isinstance(opt_model, FSDPModule):
+                # FSDP2: broadcast_from_rank0 hangs for optimizer state on
+                # multi-rank meshes.  Broadcast explicitly and load with
+                # full_state_dict=True on all ranks.
+                osd_list = [optim_sd]
+                torch.distributed.broadcast_object_list(osd_list, src=0)
+                optim_sd = osd_list[0]
+                optim_sd = _remap_channels_last_optim_sd(opt_model, optim_sd)
                 _materialize_optimizer_state_for_dcp(
                     optimizer, optim_sd.get("state", {})
                 )
