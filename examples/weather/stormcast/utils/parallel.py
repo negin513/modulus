@@ -270,6 +270,8 @@ class ParallelHelper:
         # arrive in that layout, so the perf win is retained.
         with torch.no_grad():
             for p in model.parameters():
+                if isinstance(p.data, DTensor):
+                    continue  # distribute_module already normalises DTensor local shards
                 if p.is_contiguous():
                     continue
                 p.data = p.data.contiguous()
