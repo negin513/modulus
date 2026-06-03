@@ -253,12 +253,6 @@ class ParallelHelper:
         torch.distributed.fsdp.FSDPModule
             The input model, now an ``FSDPModule`` with sharded parameters.
         """
-        if self.use_shard_tensor:
-            model = distribute_module(
-                model,
-                device_mesh=self.mesh["domain"],
-                partition_fn=partition_model_selective,
-            )
         # FSDP2 rejects non-contiguous parameters with
         #   NotImplementedError: FSDP does not support non-contiguous parameters
         # raised from torch.distributed.fsdp._fully_shard._fsdp_param.
@@ -270,11 +264,14 @@ class ParallelHelper:
         # arrive in that layout, so the perf win is retained.
         with torch.no_grad():
             for p in model.parameters():
-                if isinstance(p.data, DTensor):
-                    continue  # distribute_module already normalises DTensor local shards
-                if p.is_contiguous():
-                    continue
-                p.data = p.data.contiguous()
+                if not p.is_contiguous():
+                    p.data = p.data.contiguous()
+        if self.use_shard_tensor:
+            model = distribute_module(
+                model,
+                device_mesh=self.mesh["domain"],
+                partition_fn=partition_model_selective,
+            )
         fully_shard(model, mesh=self.mesh["ddp"])
         return model
 
