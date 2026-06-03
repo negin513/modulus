@@ -69,16 +69,7 @@ checkpoint_logging = PythonLogger("checkpoint")
 
 def _is_distributed_model(model: torch.nn.Module) -> bool:
     """Return ``True`` when *model* is FSDP-wrapped or has DTensor params.
-
-    The ``FSDPModule`` check is essential and must come first: FSDP2
-    (``fully_shard``) does not expose its parameters as ``DTensor`` until
-    lazy initialization runs, so right after wrapping ``model.parameters()``
-    can still yield plain ``Parameter`` objects.  Relying on the DTensor scan
-    alone makes detection *time-dependent* -- it returns ``False`` at save
-    time (params not yet materialized) but ``True`` at load time, so the
-    optimizer state is saved with the plain ``optimizer.state_dict()``
-    (integer-indexed) yet loaded through DCP's ``set_optimizer_state_dict``
-    (FQN-keyed), which then raises ``KeyError: 'state.0.step'``.
+    FSDP: FSDP1, FSDPModule: FSDP2 (fully_shard)
     """
     if isinstance(model, (FSDP, FSDPModule)):
         return True

@@ -256,16 +256,17 @@ class ParallelHelper:
         # FSDP2 rejects non-contiguous parameters with
         #   NotImplementedError: FSDP does not support non-contiguous parameters
         # raised from torch.distributed.fsdp._fully_shard._fsdp_param.
-        # Models created with ``.to(memory_format=torch.channels_last)`` have
-        # 4D conv params with channels_last strides (e.g. shape (32, 12, 4, 4)
-        # with stride (192, 1, 48, 12) -- DiT's patch-embed conv is one
-        # example).  Force standard contiguity on the parameter storage;
-        # kernels still convert activations to channels_last when inputs
+        # https://github.com/pytorch/pytorch/issues/166291
+        # StormCast deliberately makes conv weights channels-last (perf optimization with cuDNN)
+        # --> but results in non-contiguous parameters.
+
+        # Note: cuDNN kernels still convert activations to channels_last when inputs
         # arrive in that layout, so the perf win is retained.
         with torch.no_grad():
             for p in model.parameters():
                 if not p.is_contiguous():
                     p.data = p.data.contiguous()
+
         if self.use_shard_tensor:
             model = distribute_module(
                 model,
