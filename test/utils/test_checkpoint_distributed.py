@@ -182,7 +182,16 @@ class _ConvNet(nn.Module):
 
 
 def _all_ranks_bit_exact(t: torch.Tensor) -> bool:
-    """True iff every rank holds element-wise bit-identical values for *t*."""
+    """True iff every rank holds element-wise bit-identical values for *t*.
+
+    For a sharded ``DTensor`` (e.g. an FSDP2 ``fully_shard`` parameter) each
+    rank holds a *different* local shard by design, and ``dist.all_reduce``
+    cannot operate on a DTensor directly.  Gather the full tensor first: a
+    correct checkpoint round-trip yields the same full tensor on every rank,
+    so the cross-rank MIN and MAX then match.
+    """
+    if isinstance(t, DTensor):
+        t = t.full_tensor()
     t_min = t.detach().clone().float()
     t_max = t.detach().clone().float()
     dist.all_reduce(t_min, op=dist.ReduceOp.MIN)
