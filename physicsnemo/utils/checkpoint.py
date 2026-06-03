@@ -105,14 +105,7 @@ def _unwrap_ddp_compile(
 
 
 def _unwrap_fsdp(model: torch.nn.Module) -> torch.nn.Module:
-    """Unwrap one FSDP layer (if present) to reach the user module.
-
-    For FSDP1 this returns ``model.module`` (the user module inside the
-    ``FullyShardedDataParallel`` wrapper).  For FSDP2 the user module IS the
-    same object — ``fully_shard`` mutates its ``__class__`` in place — so
-    nothing to unwrap; callers that need the *original* class name should use
-    :func:`_unwrapped_class_name` rather than ``type(...).__name__``.
-    """
+    """Unwrap one FSDP layer (if present) to reach the user module."""
     if isinstance(model, FSDP):
         return model.module
     return model
