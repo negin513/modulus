@@ -1472,9 +1472,7 @@ def _load_checkpoint_distributed(
                 # for FSDPModule on multi-rank meshes.  Broadcast the full
                 # state dict explicitly and let DCP handle the DTensor
                 # sharding locally on each rank via full_state_dict=True.
-                sd_list = [
-                    model_state_dicts.get(name, {}) if is_rank0 else {}
-                ]
+                sd_list = [model_state_dicts.get(name, {}) if is_rank0 else {}]
                 torch.distributed.broadcast_object_list(sd_list, src=0)
                 sd = _force_standard_contiguous(sd_list[0])
                 set_model_state_dict(model, sd, options=full_options)
