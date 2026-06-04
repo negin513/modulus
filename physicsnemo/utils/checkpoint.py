@@ -221,16 +221,14 @@ def _get_dtensor_param_placements(
     return info
 
 
-def _has_non_fsdp_dtensors(
+def _needs_dcp_broadcast_bypass(
     model: torch.nn.Module,
     dtensor_plc: dict[str, tuple[Any, tuple[Any, ...]]],
 ) -> bool:
-    """Return ``True`` when *dtensor_plc* requires the manual broadcast path.
+    """Return ``True`` when loading should bypass DCP's ``broadcast_from_rank0``.
 
-    The function answers a single operational question: does loading this
-    model's state dict need to bypass DCP's ``broadcast_from_rank0`` in
-    favour of the explicit ``broadcast_object_list`` /
-    ``_redistribute_sd_for_dtensor`` path?  The answer is ``True`` for:
+    Use the explicit ``broadcast_object_list`` /
+    ``_redistribute_sd_for_dtensor`` path instead.  Returns ``True`` for:
 
     * Plain (non-FSDP) modules holding DTensors (e.g. user-created ShardTensors
       on a domain mesh) — DCP's broadcast cannot rebuild user placements.
@@ -1342,7 +1340,7 @@ def load_model_weights(
             state_dict = torch.load(cached, map_location=device, weights_only=False)
 
     dtensor_plc = _get_dtensor_param_placements(model)
-    if _has_non_fsdp_dtensors(model, dtensor_plc):
+    if _needs_dcp_broadcast_bypass(model, dtensor_plc):
         sd_list: list[Any] = [state_dict]
         torch.distributed.broadcast_object_list(sd_list, src=0)
         state_dict = _redistribute_sd_for_dtensor(dtensor_plc, sd_list[0])
@@ -1440,7 +1438,7 @@ def _load_checkpoint_distributed(
             # This is needed because use_orig_params=False flattens DTensor
             # params into a plain FlatParameter, hiding them from inspection.
             dtensor_plc = _get_dtensor_param_placements(model)
-            if _has_non_fsdp_dtensors(model, dtensor_plc):
+            if _needs_dcp_broadcast_bypass(model, dtensor_plc):
                 # broadcast_from_rank0 does not handle user-managed DTensor
                 # redistribution (e.g. ShardTensor on a domain mesh), so we
                 # broadcast the full state dict ourselves and convert entries
@@ -1524,7 +1522,7 @@ def _load_checkpoint_distributed(
         optim_sd = checkpoint_dict.get("optimizer_state_dict", {}) if is_rank0 else {}
         if opt_model is not None and _is_distributed_model(opt_model):
             dtensor_plc = _get_dtensor_param_placements(opt_model)
-            if _has_non_fsdp_dtensors(opt_model, dtensor_plc):
+            if _needs_dcp_broadcast_bypass(opt_model, dtensor_plc):
                 osd_list: list[Any] = [optim_sd]
                 torch.distributed.broadcast_object_list(osd_list, src=0)
                 optim_sd = _redistribute_optim_sd_for_dtensor(dtensor_plc, osd_list[0])
