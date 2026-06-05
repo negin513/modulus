@@ -404,13 +404,9 @@ def _materialize_optimizer_state_for_dcp(
 
 
 def _fsdp_uses_flat_param_optim(model: torch.nn.Module | None) -> bool:
-    """Return True if *model* is FSDP-wrapped with ``use_orig_params=False``.
-
-    That is the only configuration in which optimizer state goes through
-    the FlatParameter flatten/unflatten path (and therefore the only
-    configuration affected by the channels_last asymmetry). With
-    ``use_orig_params=True`` FSDP exposes per-original-param optimizer
-    state and the round-trip is layout-preserving on its own.
+    """
+    Returns True only for FSDP1 with use_orig_params=False (FlatParameter optimizer path).
+    Not needed after dropping FSDP1 support.
     """
     if not isinstance(model, FSDP):
         return False
@@ -421,13 +417,11 @@ def _strides_match_channels_last(
     shape: tuple[int, ...] | torch.Size,
     stride: tuple[int, ...],
 ) -> bool:
-    """True iff *stride* matches the canonical NHWC / NDHWC stride formula.
+    """
+    Checks whether a tensor’s strides match canonical channels_last (4D) or channels_last_3d (5D) layout.
 
-    For 4-D ``(N, C, H, W)`` the channels_last layout has strides
-    ``(C*H*W, 1, W*C, C)``; for 5-D ``(N, C, D, H, W)`` channels_last_3d
-    has strides ``(D*H*W*C, 1, H*W*C, W*C, C)``. Anything else -- including
-    standard-contig tensors that happen to satisfy ``stride[1] == 1`` because
-    of trailing-1 dims -- returns False.
+    Used to determine whether to remap optimizer state for channels_last tensors.
+    Not needed after dropping FSDP1 support (only affects FSDP1 with use_orig_params=False).
     """
     if len(shape) != len(stride):
         return False
@@ -441,29 +435,14 @@ def _strides_match_channels_last(
 
 
 def _get_cl_param_fqns(opt_model: torch.nn.Module | None) -> set[str]:
-    """Return FQNs of FSDP-managed original params recorded as channels_last.
+    """
+    Scans FSDP1 FlatParameter metadata (_fqns, _strides, _contiguities) to find which original
+    params are stored in channels_last byte order. 
 
-    For every FSDP submodule in *opt_model*, reads ``flat_param._fqns`` /
-    ``_shapes`` / ``_strides`` / ``_contiguities`` and returns the set of
-    original-parameter FQNs whose ``_contiguities[i] is False`` and whose
-    recorded strides match the canonical ``channels_last`` (4-D) or
-    ``channels_last_3d`` (5-D) formula. That is the same bit
-    ``_get_unflat_views`` consults to decide ``view`` vs ``as_strided`` on
-    save -- so ``_contiguities[i] is False`` plus a CL stride pattern is
-    exactly the signal that the destination ``FlatParameter`` slot expects
-    NHWC storage order at load time.
+    Returns their fully-qualified names (FQNs).
+    Returns an empty set when opt_model is not FSDP1 with use_orig_params=False.
 
-    Returns an empty set when *opt_model* isn't FSDP+``use_orig_params=False``
-    (the only configuration where the flatten/unflatten asymmetry exists).
-
-    Each FQN is built as ``{module_path_to_FSDP}.{flat_param._fqns[i]}``,
-    matching DCP's ``_get_fqns`` convention -- specifically, FSDP's
-    ``_fsdp_wrapped_module`` segments are stripped from the path so the
-    returned FQNs line up with the keys in ``optim_sd["state"]``.
-
-    The ``_orig_mod.`` (``torch.compile``) prefix is also stripped, matching
-    the normalization ``save_checkpoint`` applies to optimizer
-    ``param_names``.
+    Not needed after dropping FSDP1 support (only affects FSDP1 with use_orig_params=False).
     """
     if not _fsdp_uses_flat_param_optim(opt_model):
         return set()
@@ -503,42 +482,14 @@ def _remap_channels_last_optim_sd(
     opt_model: torch.nn.Module | None,
     optim_sd: dict[str, Any],
 ) -> dict[str, Any]:
-    """Compensate for an FSDP optim-state flatten/unflatten asymmetry.
+    """
+    Fixes FSDP1 FlatParameter flatten/unflatten asymmetry:
+     - save reads bytes in storage order, load reads in logical order. 
+     
+    For channels_last conv weights, permutes optimizer state tensors so the load-side flatten sees the correct byte layout.
+    Also normalizes non-CL tensors to standard contiguity. 
 
-    PyTorch FSDP with ``use_orig_params=False`` packs and unpacks the
-    ``FlatParameter`` asymmetrically for non-truly-contiguous params:
-
-    * Save path (``_get_unflat_views``) uses
-      ``as_strided((numel,), (1,))`` -- bytes are read in *storage* order.
-    * Load path (``_flatten_tensor_optim_state``) uses ``torch.flatten``
-      -- bytes are read in *logical* (row-major) order.
-
-    For a 4-D Conv2d weight in ``channels_last`` format the two orders
-    differ, so the round-trip silently corrupts the optimizer state.
-
-    The remap is gated on the **destination** ``FlatParameter`` slot's
-    expected byte order (via ``flat_param._contiguities``), not on the
-    saved tensor's layout. That's the only signal that always matches what
-    the load-side ``_flatten_tensor_optim_state`` will do, so it works for
-    every save/load layout combination -- in particular for
-    ``FSDP+ShardTensor`` configurations where ``distribute_module`` calls
-    ``.contiguous()`` and silently strips channels_last before FSDP wraps,
-    making saved tensors standard-contig even though the conceptual model
-    has CL conv weights.
-
-    Inputs are also normalized to standard contiguity before the layout
-    decision: a CL tensor that *isn't* getting permuted (because the
-    destination is non-CL) would otherwise survive into DCP's per-tensor
-    ``dist.broadcast`` and hit the same layout-blind broadcast bug
-    ``_force_standard_contiguous`` fixes for model state.
-
-    Only fires when *opt_model* is FSDP-wrapped with
-    ``use_orig_params=False`` -- with ``use_orig_params=True`` the
-    asymmetry doesn't exist and the remap would *cause* the corruption it
-    is meant to prevent.
-
-    See ``torch/distributed/fsdp/_optim_utils.py::_flatten_tensor_optim_state``
-    and ``_flat_param.py::flatten_tensors``.
+    Not needed after dropping FSDP1 support (only affects FSDP1 with use_orig_params=False).
     """
     if "state" not in optim_sd:
         return optim_sd
@@ -578,7 +529,9 @@ def _remap_channels_last_optim_sd(
 
 
 def _is_mdlus_archive(path: str) -> bool:
-    """Return ``True`` if *path* is a ``.mdlus`` archive (tar or zip containing ``model.pt``)."""
+    """
+    Checks if a path is a .mdlus archive (tar or zip containing model.pt).
+    """
     cached = _cache_if_needed(path)
     if tarfile.is_tarfile(cached):
         with tarfile.open(cached, "r") as tar:
@@ -592,7 +545,10 @@ def _is_mdlus_archive(path: str) -> bool:
 def _extract_mdlus_state_dict(
     file_name: str, device: str | torch.device = "cpu"
 ) -> dict[str, Any]:
-    """Read only the ``state_dict`` from a ``.mdlus`` archive."""
+    """
+    Reads only the state_dict from a .mdlus file without instantiating the full model. 
+    Used in distributed load where rank 0 reads the file and broadcasts tensors.
+    """
     cached = _cache_if_needed(file_name)
     fmt = Module._detect_checkpoint_format(cached)
 
@@ -618,16 +574,8 @@ def _get_checkpoint_filename(
     model_type: str = "mdlus",
     distributed: bool = False,
 ) -> str:
-    r"""Build the filename for a numbered checkpoint.
-
-    Resolution logic:
-
-    * **Explicit index** (``index`` is not ``None``): returns that exact
-      checkpoint path.
-    * **Latest** (``index is None``, ``saving=False``): scans for existing
-      checkpoints and returns the one with the largest index.
-    * **Next** (``index is None``, ``saving=True``): returns the path for
-      the *next* index after the largest existing one.
+    """
+    Builds the filename for a numbered checkpoint.
 
     When no existing checkpoints are found, the returned path uses index 0.
 
@@ -1305,7 +1253,9 @@ def _load_checkpoint_distributed(
     optimizer_model: torch.nn.Module | None,
     is_rank0: bool,
 ) -> int:
-    """Distributed load: rank 0 reads files, DCP broadcasts to all ranks."""
+    """
+    Distributed load: rank 0 reads files, DCP broadcasts to all ranks.
+    """
     broadcast_options = StateDictOptions(
         full_state_dict=True, broadcast_from_rank0=True
     )
@@ -1558,12 +1508,9 @@ def get_checkpoint_dir(base_dir: Path | str, model_name: str) -> str:
 
 
 def _cache_if_needed(path: str) -> str:
-    r"""Return a local path for ``path``, downloading to cache if remote.
+    """
+    For remote fsspec URIs, downloads to a local cache and returns the local path. 
 
-    For the ``"file"`` protocol the path is returned unchanged.  For remote
-    protocols the file is fetched via
-    :func:`~physicsnemo.core.filesystem._download_cached` into a
-    process-specific cache directory.
 
     Parameters
     ----------
