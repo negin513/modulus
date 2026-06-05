@@ -181,21 +181,12 @@ def _materialize_dtensors_to_full(state_dict: dict[str, Any]) -> dict[str, Any]:
 
 
 def _force_standard_contiguous(state_dict: dict[str, Any]) -> dict[str, Any]:
-    """Make positive-dim, non-DTensor tensors standard-contiguous.
+    """
+    Before broadcasting model/optim state from rank 0,
+    converts channels_last tensors to standard NCHW layout via .contiguous(). 
 
-    Compensates for a layout-blind broadcast inside DCP's
-    ``set_model_state_dict`` / ``set_optimizer_state_dict``: the rank-0→others
-    transfer goes through ``dist.broadcast``, which is happy to send a
-    ``channels_last`` tensor (its contiguity check passes for that format) but
-    moves bytes in *storage* order. Receivers on non-zero ranks allocate via
-    ``torch.empty(shape, dtype, device)`` (standard NCHW), so CL bytes land
-    in NCHW positions and values are silently permuted on receive.
-
-    Forcing standard contiguity on rank 0 makes the broadcast layout-consistent.
-    ``.contiguous()`` is a no-op for tensors that are already standard-contig,
-    a value-preserving (logical) copy for ``channels_last`` /
-    ``channels_last_3d``, and is intentionally skipped for ``DTensor`` (whose
-    contiguity semantics differ).
+    This is necessary because DCP's broadcast_from_rank0 does not handle channels_last tensors (torch bug)
+    Needed for both FSDP1 + FSDP2.
     """
     out: dict[str, Any] = {}
     for k, v in state_dict.items():
@@ -211,12 +202,8 @@ def _force_standard_contiguous(state_dict: dict[str, Any]) -> dict[str, Any]:
 def _get_dtensor_param_placements(
     model: torch.nn.Module,
 ) -> dict[str, tuple[Any, tuple[Any, ...]]]:
-    """Map parameter names to ``(device_mesh, placements)`` for DTensor params.
-
-    Uses ``get_model_state_dict`` with native (non-full) format so that the
-    DCP layer unflattens FlatParameters back to original names and preserves
-    each parameter's DTensor placement.  This works correctly for both
-    ``use_orig_params=True`` and ``use_orig_params=False``.
+    """
+    Builds a map {param_name: (device_mesh, placements)} for every DTensor param.
 
     **Collective** — all ranks must call this together.
     """
@@ -232,41 +219,22 @@ def _needs_dcp_broadcast_bypass(
     model: torch.nn.Module,
     dtensor_plc: dict[str, tuple[Any, tuple[Any, ...]]],
 ) -> bool:
-    """Return ``True`` when loading should bypass DCP's ``broadcast_from_rank0``.
+    """
+    Return ``True`` when loading should bypass DCP's ``broadcast_from_rank0``.
 
     Use the explicit ``broadcast_object_list`` /
-    ``_redistribute_sd_for_dtensor`` path instead.  Returns ``True`` for:
+    ``_redistribute_sd_for_dtensor`` path instead for:
 
-    * Plain (non-FSDP) modules holding DTensors (e.g. user-created ShardTensors
-      on a domain mesh) — DCP's broadcast cannot rebuild user placements.
-    * ``FSDP`` (FSDP1) with ``NO_SHARD`` — equivalent to plain DDP, no
-      FSDP-managed DTensors to be aware of.
-    * ``FSDPModule`` (FSDP2) whose parameters sit on a mesh with any
-      *degenerate* dimension (``size == 1``).  In that case DCP's underlying
-      ``dist.broadcast`` raises
-      ``RuntimeError: found no DeviceMesh from dtensor args for c10d::broadcast_``
-      because c10d cannot dispatch through a size-1 mesh axis.  The same
-      configuration also breaks DCP's optimizer load with
-      ``KeyError: 'state.0.step'`` (the freshly-constructed live optimizer has
-      no materialised ``state``, so DCP's flatten-mapping is missing the
-      checkpoint's ``state.X.step`` keys).  Both surface when ``fully_shard``
-      runs on world_size == 1, or on a 2D mesh whose ``ddp`` axis collapses
-      to 1 (e.g. ``(ddp=1, domain=N)`` after batch_size==1 on N ranks).
-      The manual path sidesteps both — it broadcasts the dict as Python
-      objects and then sets state with ``options=full_options`` (no DCP
-      broadcast, no unflatten round-trip).
-    * ``FSDPModule`` (FSDP2) on ``world_size == 1`` (or any configuration
-      where ``fully_shard`` does not materialise DTensor parameters, so
-      ``dtensor_plc`` is empty).  The optimizer load still trips the
-      ``KeyError: 'state.0.step'`` above — the live optimizer has no
-      materialised ``state``, so DCP's flatten-mapping is missing the
-      checkpoint's ``state.X.step`` keys.  Forcing the manual path makes
-      ``set_optimizer_state_dict`` use ``options=full_options`` and
-      sidesteps DCP's flatten/unflatten round-trip.
+    * Plain modules with user-managed DTensor params (domain mesh)
+    * FSDP1 + NO_SHARD
+    * FSDP2 with a degenerate mesh axis (size == 1)
+    * FSDP2 with no materialized DTensor params (e.g. 1-GPU)
 
-    Without this fix, ``test_checkpointing`` at 1-GPU with FSDP2 crashes
-    with ``KeyError: 'state.0.step'`` or ``RuntimeError: found no
-    DeviceMesh`` depending on the mesh configuration.
+    Without this fix, loading a checkpoint with FSDP2 on 1-GPU crashes with 
+    ``KeyError: 'state.0.step'`` or ``RuntimeError: found no DeviceMesh`` depending on the mesh configuration.
+
+    FSDP: FSDP1
+    FSDPModule: FSDP2
     """
     if isinstance(model, FSDPModule):
         if not dtensor_plc:
@@ -285,32 +253,18 @@ def _redistribute_sd_for_dtensor(
     placements: dict[str, tuple[Any, tuple[Any, ...]]],
     state_dict: dict[str, Any],
 ) -> dict[str, Any]:
-    """Convert tensors in *state_dict* to DTensors matching *placements*.
+    """
+    Converts tensors in *state_dict* to DTensors matching *placements*.
 
-    Entries whose key appears in *placements* are converted via
-    ``distribute_tensor`` so that each rank receives its correct local shard.
+    Entries whose key appears in *placements* are converted to DTensors via
+    distribute_tensor so that each rank receives its correct local shard.
 
-    Three input shapes are supported per entry:
-
-    * **Plain tensor** — distributed onto the target ``(mesh, placements)``.
-    * **DTensor on the same mesh as the target** — passed through unchanged
-      (no redistribution needed).
-    * **DTensor on a different mesh** (e.g. a checkpoint saved under
-      ``(ddp=N,)`` being reloaded onto ``(ddp=1, domain=N)``).  ``distribute_tensor``
-      refuses to re-mesh DTensors across non-parent meshes, so we first
-      extract the underlying data via ``to_local`` and then redistribute.
-      This relies on the save side having materialised the full tensor on
-      every rank (e.g. via ``StateDictOptions(full_state_dict=True)`` or an
-      explicit ``DTensor.full_tensor()`` round-trip); each rank's local copy
-      is then the full data, and the new ``distribute_tensor`` sharding is
-      correct.
-
-    When *placements* is empty (e.g. FSDP2 on ``world_size == 1`` materialises
+    When *placements* is empty (e.g. FSDP2 on world_size == 1 materialises
     no DTensor parameters), the state dict is returned as-is.
 
     Without this fix, cross-mesh checkpoint reloads (e.g. save with
-    ``ddp=4``, load with ``ddp=1, domain=4``) fail because
-    ``distribute_tensor`` refuses to re-mesh an existing DTensor.
+    ddp=4, load with ddp=1, domain=4) fail because
+    distribute_tensor refuses to re-mesh an existing DTensor.
     """
     if not placements:
         return dict(state_dict)
@@ -348,25 +302,19 @@ def _redistribute_optim_sd_for_dtensor(
     placements: dict[str, tuple[Any, tuple[Any, ...]]],
     optim_sd: dict[str, Any],
 ) -> dict[str, Any]:
-    """Shard optimizer state tensors to local chunks matching model placements.
+    """
+    Shard optimizer state tensors to local chunks matching model placements.
 
-    FSDP's ``optim_state_dict_to_load`` expects each optimizer state tensor
-    (``exp_avg``, ``exp_avg_sq``, …) to be a **plain tensor** whose shape
-    matches the parameter's *local* shape — not a DTensor.  We use
-    ``distribute_tensor(...).to_local()`` to extract each rank's shard.
-    Scalar state entries (e.g. ``step``) are left unchanged.
+    FSDP's optim_state_dict_to_load expects each optimizer state tensor 
+    (exp_avg, exp_avg_sq, ...) to be a plain tensor whose shape
+    matches the parameter's local_shape - not a DTensor.  We use
+    distribute_tensor(...).to_local() to extract each rank's shard.
+    Scalar state entries (e.g. step) are left unchanged.
+    
+    When placements is empty (e.g. FSDP2 on world_size == 1 materialises no DTensor parameters),
+    the optimizer state dict is returned as-is - the live optimizer expects plain tensors and the serialized data already matches.
 
-    DTensor entries coming from a checkpoint whose mesh differs from the
-    target are first reduced to plain data via ``to_local()`` before being
-    redistributed; same-mesh DTensors are passed through unchanged.
-
-    When *placements* is empty (e.g. FSDP2 on ``world_size == 1``
-    materialises no DTensor parameters), the optimizer state dict is
-    returned as-is — the live optimizer expects plain tensors and the
-    serialized data already matches.
-
-    Without this fix, optimizer reload fails on cross-mesh scenarios
-    for the same reason as :func:`_redistribute_sd_for_dtensor`.
+    Without this fix, optimizer reload fails on cross-mesh scenarios for the same reason as _redistribute_sd_for_dtensor.
     """
     if "state" not in optim_sd:
         return optim_sd
@@ -418,35 +366,16 @@ def _materialize_optimizer_state_for_dcp(
     optimizer: torch.optim.Optimizer,
     loaded_state: dict[Any, Any],
 ) -> None:
-    """Pre-populate ``optimizer.state[p]`` so DCP's flatten mapping covers
-    every key in *loaded_state*.
-
-    ``torch.distributed.checkpoint.state_dict.set_optimizer_state_dict``
-    builds its flatten/unflatten mapping from the **live** optimizer's
-    ``state_dict()``.  A freshly-constructed optimizer has empty
-    ``state``, so the mapping has only ``param_groups.*`` keys.  When the
-    checkpoint being loaded carries trained state with ``state.X.step``,
-    ``state.X.exp_avg`` etc., DCP's ``_unflatten_state_dict`` raises
-    ``KeyError: 'state.0.step'`` because the mapping is missing the
-    corresponding entry.
-
-    This helper inspects the loaded optimizer state's first entry to
-    discover which keys are present (e.g. ``step``, ``exp_avg``,
-    ``exp_avg_sq``) and writes zero-valued placeholders into
-    ``optimizer.state[p]`` for every parameter.  The placeholders are
-    immediately overwritten by ``set_optimizer_state_dict`` with the
-    loaded values; their only role is to extend the flatten mapping so
-    the unflatten round-trip succeeds.
-
-    Safe no-op for optimizers that already have materialized state, and
-    for checkpoints whose ``state`` is empty.
-
+    """
+    Pre-fills optimizer.state[p] with zero placeholders (step, exp_avg, etc.) before set_optimizer_state_dict. 
+    
     Without this fix, loading a trained checkpoint into a freshly
     constructed FSDP2 optimizer raises ``KeyError: 'state.0.step'``
     inside DCP's ``_unflatten_state_dict``.
     """
     if not loaded_state:
         return
+    
     # Loaded state is keyed by *index* (0, 1, ...) on save; pick any entry
     # to learn the per-param state keys.
     sample = next(iter(loaded_state.values()), None)
