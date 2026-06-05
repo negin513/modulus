@@ -199,6 +199,14 @@ def _all_ranks_bit_exact(t: torch.Tensor) -> bool:
     return torch.equal(t_min, t_max)
 
 
+def _contiguous_params_for_fsdp2(model: torch.nn.Module) -> None:
+    """FSDP2 ``fully_shard`` rejects non-contiguous parameters."""
+    with torch.no_grad():
+        for p in model.parameters():
+            if not p.is_contiguous():
+                p.data = p.data.contiguous()
+
+
 @pytest.mark.timeout(30)
 @pytest.mark.multigpu_static
 @pytest.mark.parametrize("use_orig_params", [True, False])
@@ -549,6 +557,23 @@ def _partition_pos_embed(
                 param, device_mesh=device_mesh, placements=[Shard(1)]
             )
             submodule.register_parameter(key, nn.Parameter(sharded))
+
+
+def _build_fsdp2_shard_tensor_model(
+    mesh: torch.distributed.device_mesh.DeviceMesh,
+    device: torch.device,
+    embed_tokens: int = 24,
+) -> _PosEmbedModel:
+    """Build a 2-D mesh model: domain DTensor params + FSDP2 on ddp."""
+    model = _PosEmbedModel(embed_tokens=embed_tokens, embed_dim=8, hidden=16).to(
+        device
+    )
+    model = distribute_module(
+        model, device_mesh=mesh["domain"], partition_fn=_partition_pos_embed
+    )
+    _contiguous_params_for_fsdp2(model)
+    fully_shard(model, mesh=mesh["ddp"])
+    return model
 
 
 @pytest.mark.timeout(60)
@@ -1513,3 +1538,457 @@ def test_fsdp2_grad_scaler_checkpoint(shared_tmp_dir):
     assert torch.allclose(ref_output, loaded_output, rtol=1e-5, atol=1e-5), (
         "Model outputs differ after FSDP2+GradScaler checkpoint round-trip"
     )
+
+
+# ---------------------------------------------------------------------------
+# FSDP2 — cross-mode load (1-proc save → N-proc FSDP2 load, channels_last)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.multigpu_static
+def test_fsdp2_cross_mode_channels_last_model_load(shared_tmp_dir):
+    """Save from a single (rank-0-only) non-FSDP CL model; load into N-proc FSDP2.
+
+    Mirrors ``test_cross_mode_channels_last_model_load`` for ``fully_shard``.
+    Optimizer cross-mode load is intentionally omitted (same DCP limitation as
+    the FSDP1 test — int-keyed optim state from non-distributed save).
+    """
+    dm = DistributedManager()
+    if dm.world_size < 2:
+        pytest.skip("Need at least 2 ranks")
+
+    device = dm.device
+
+    saved_params: dict[str, torch.Tensor] = {}
+    if dm.rank == 0:
+        torch.manual_seed(0)
+        model_save = _ConvNet().to(device=device, memory_format=torch.channels_last)
+        optimizer_save = torch.optim.Adam(model_save.parameters(), lr=1e-3)
+
+        x = torch.randn(2, 4, 8, 8, device=device).contiguous(
+            memory_format=torch.channels_last
+        )
+        for _ in range(2):
+            model_save(x).sum().backward()
+            optimizer_save.step()
+            optimizer_save.zero_grad()
+
+        for name, p in model_save.named_parameters():
+            saved_params[name] = p.detach().clone().contiguous().cpu()
+
+        save_checkpoint(
+            shared_tmp_dir,
+            models=model_save,
+            optimizer=optimizer_save,
+            epoch=2,
+        )
+    dist.barrier()
+
+    mesh = init_device_mesh("cuda", (dm.world_size,), mesh_dim_names=("world",))
+
+    torch.manual_seed(dm.rank + 4242)
+    model_load = _ConvNet().to(device=device, memory_format=torch.channels_last)
+    _contiguous_params_for_fsdp2(model_load)
+    fully_shard(model_load, mesh=mesh["world"])
+
+    epoch = load_checkpoint(shared_tmp_dir, models=model_load)
+    assert epoch == 2
+
+    for name, p in model_load.named_parameters():
+        assert _all_ranks_bit_exact(p), (
+            f"Parameter '{name}' differs across ranks after FSDP2 cross-mode load"
+        )
+
+    full_loaded_model = get_model_state_dict(
+        model_load, options=StateDictOptions(full_state_dict=True)
+    )
+    if dm.rank == 0:
+        for name, expected in saved_params.items():
+            assert name in full_loaded_model, f"Loaded model state missing '{name}'"
+            actual = full_loaded_model[name].detach().contiguous().cpu()
+            assert torch.equal(actual, expected), (
+                f"Logical model values for '{name}' differ between save and "
+                f"load (FSDP2 cross-mode)"
+            )
+
+
+# ---------------------------------------------------------------------------
+# load_model_weights — FSDP2 (fully_shard)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.multigpu_static
+@pytest.mark.parametrize("model_type", ["physicsnemo", "pytorch"])
+def test_load_model_weights_fsdp2(shared_tmp_dir, model_type):
+    """``load_model_weights`` loads a single file into an FSDP2-wrapped model."""
+    dm = DistributedManager()
+    if dm.world_size < 2:
+        pytest.skip("Need at least 2 ranks")
+
+    device = dm.device
+    mesh = init_device_mesh("cuda", (dm.world_size,), mesh_dim_names=("world",))
+
+    if model_type == "physicsnemo":
+        model = FullyConnected(
+            in_features=16, out_features=16, num_layers=2, layer_size=32
+        ).to(device)
+        weights_file = f"{shared_tmp_dir}/trained_fsdp2.mdlus"
+    else:
+        model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 16)).to(
+            device
+        )
+        weights_file = f"{shared_tmp_dir}/trained_fsdp2.pt"
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+    x = torch.randn(4, 16, device=device)
+    for _ in range(3):
+        model(x).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+    if dm.rank == 0:
+        if model_type == "physicsnemo":
+            model.save(weights_file)
+        else:
+            torch.save(model.state_dict(), weights_file)
+    dist.barrier()
+
+    with torch.no_grad():
+        ref_output = model(x).clone()
+
+    if model_type == "physicsnemo":
+        model2 = FullyConnected(
+            in_features=16, out_features=16, num_layers=2, layer_size=32
+        ).to(device)
+    else:
+        model2 = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 16)).to(
+            device
+        )
+    fully_shard(model2, mesh=mesh["world"])
+
+    load_model_weights(model2, weights_file)
+
+    with torch.no_grad():
+        loaded_output = model2(x)
+    assert torch.allclose(ref_output, loaded_output, rtol=1e-5, atol=1e-5), (
+        "Model outputs differ after load_model_weights into FSDP2 model"
+    )
+
+
+# ---------------------------------------------------------------------------
+# load_model_weights — FSDP2 + domain DTensor on 2-D mesh
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.multigpu_static
+@pytest.mark.skipif(not _HAS_TORCH_26, reason="ShardTensor requires torch >= 2.6")
+@pytest.mark.parametrize("file_format", ["mdlus", "pt"])
+def test_load_model_weights_fsdp2_shard_tensor(shared_tmp_dir, file_format):
+    """``load_model_weights`` loads a single file into FSDP2 + domain DTensor model."""
+    torch.manual_seed(0)
+
+    dm = DistributedManager()
+    if dm.world_size < 4 or dm.world_size % 2 != 0:
+        pytest.skip("Need at least 4 ranks (divisible by 2) for 2-D mesh test")
+
+    device = dm.device
+    domain_size = 2
+    dp_size = dm.world_size // domain_size
+    mesh = init_device_mesh(
+        "cuda", (dp_size, domain_size), mesh_dim_names=("ddp", "domain")
+    )
+
+    embed_tokens = 24
+
+    model = _PosEmbedModel(embed_tokens=embed_tokens, embed_dim=8, hidden=16).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+    x_full = torch.randn(2, embed_tokens, 8, device=device)
+    for _ in range(3):
+        model(x_full).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+    with torch.no_grad():
+        ref_output = model(x_full).clone()
+
+    weights_file = f"{shared_tmp_dir}/trained_fsdp2_shard.{file_format}"
+    if dm.rank == 0:
+        if file_format == "mdlus":
+            model.save(weights_file)
+        else:
+            torch.save(model.state_dict(), weights_file)
+    dist.barrier()
+
+    fsdp_model2 = _build_fsdp2_shard_tensor_model(mesh, device, embed_tokens)
+    load_model_weights(fsdp_model2, weights_file)
+
+    full_options = StateDictOptions(full_state_dict=True)
+    loaded_params = get_model_state_dict(fsdp_model2, options=full_options)
+    ref_params = model.state_dict()
+    if dm.rank == 0:
+        for key in ref_params:
+            assert torch.allclose(
+                ref_params[key].cpu(), loaded_params[key].cpu(), rtol=1e-5, atol=1e-5
+            ), f"Parameter {key} differs after FSDP2 load_model_weights"
+
+    assert isinstance(fsdp_model2.pos_embed, DTensor), (
+        "pos_embed should be a DTensor after FSDP2 load_model_weights"
+    )
+    assert fsdp_model2.pos_embed.to_local().shape[1] == embed_tokens // domain_size
+
+    x_sharded = distribute_tensor(
+        x_full, device_mesh=mesh["domain"], placements=[Shard(1)]
+    )
+    with torch.no_grad():
+        loaded_output = fsdp_model2(x_sharded).full_tensor()
+    assert torch.allclose(ref_output, loaded_output, rtol=1e-4, atol=1e-4), (
+        "Model outputs differ after load_model_weights into FSDP2 2-D mesh model"
+    )
+
+
+# ---------------------------------------------------------------------------
+# FSDP2 — missing checkpoint directory
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(15)
+@pytest.mark.multigpu_static
+def test_fsdp2_distributed_missing_directory_returns_zero(shared_tmp_dir):
+    """``load_checkpoint`` returns 0 when the checkpoint dir is missing (FSDP2)."""
+    dm = DistributedManager()
+    if dm.world_size < 2:
+        pytest.skip("Need at least 2 ranks")
+
+    device = dm.device
+    mesh = init_device_mesh("cuda", (dm.world_size,), mesh_dim_names=("world",))
+
+    model = FullyConnected(
+        in_features=8, out_features=8, num_layers=2, layer_size=16
+    ).to(device)
+    fully_shard(model, mesh=mesh["world"])
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    epoch = load_checkpoint(
+        shared_tmp_dir + "/nonexistent",
+        models=model,
+        optimizer=optimizer,
+        optimizer_model=model,
+    )
+    assert epoch == 0
+
+
+# ---------------------------------------------------------------------------
+# FSDP2 — multiple models in one checkpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.multigpu_static
+def test_fsdp2_multiple_models_checkpoint(shared_tmp_dir):
+    """Checkpoint round-trip with two separate FSDP2-wrapped models."""
+    dm = DistributedManager()
+    if dm.world_size < 2:
+        pytest.skip("Need at least 2 ranks")
+
+    device = dm.device
+    mesh = init_device_mesh("cuda", (dm.world_size,), mesh_dim_names=("world",))
+
+    model_a = FullyConnected(
+        in_features=8, out_features=8, num_layers=2, layer_size=16
+    ).to(device)
+    model_b = FullyConnected(
+        in_features=4, out_features=4, num_layers=2, layer_size=16
+    ).to(device)
+    fully_shard(model_a, mesh=mesh["world"])
+    fully_shard(model_b, mesh=mesh["world"])
+
+    x_a = torch.randn(2, 8, device=device)
+    x_b = torch.randn(2, 4, device=device)
+
+    opt_a = torch.optim.Adam(model_a.parameters(), lr=1e-3)
+    opt_b = torch.optim.Adam(model_b.parameters(), lr=1e-3)
+    for _ in range(3):
+        model_a(x_a).sum().backward()
+        opt_a.step()
+        opt_a.zero_grad()
+        model_b(x_b).sum().backward()
+        opt_b.step()
+        opt_b.zero_grad()
+
+    with torch.no_grad():
+        ref_a = model_a(x_a).clone()
+        ref_b = model_b(x_b).clone()
+
+    save_checkpoint(shared_tmp_dir, models=[model_a, model_b], epoch=1)
+    dist.barrier()
+
+    model_a2 = FullyConnected(
+        in_features=8, out_features=8, num_layers=2, layer_size=16
+    ).to(device)
+    model_b2 = FullyConnected(
+        in_features=4, out_features=4, num_layers=2, layer_size=16
+    ).to(device)
+    fully_shard(model_a2, mesh=mesh["world"])
+    fully_shard(model_b2, mesh=mesh["world"])
+
+    epoch = load_checkpoint(shared_tmp_dir, models=[model_a2, model_b2])
+    assert epoch == 1
+
+    with torch.no_grad():
+        loaded_a = model_a2(x_a)
+        loaded_b = model_b2(x_b)
+    assert torch.allclose(ref_a, loaded_a, rtol=1e-5, atol=1e-5), (
+        "Model A outputs differ after multi-model FSDP2 checkpoint round-trip"
+    )
+    assert torch.allclose(ref_b, loaded_b, rtol=1e-5, atol=1e-5), (
+        "Model B outputs differ after multi-model FSDP2 checkpoint round-trip"
+    )
+
+
+# ---------------------------------------------------------------------------
+# FSDP2 — plain nn.Module (not physicsnemo.Module)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.multigpu_static
+def test_fsdp2_pytorch_module_checkpoint_roundtrip(shared_tmp_dir):
+    """Checkpoint round-trip for a plain ``nn.Module`` under FSDP2."""
+    dm = DistributedManager()
+    if dm.world_size < 2:
+        pytest.skip("Need at least 2 ranks")
+
+    device = dm.device
+    mesh = init_device_mesh("cuda", (dm.world_size,), mesh_dim_names=("world",))
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 16)).to(device)
+    fully_shard(model, mesh=mesh["world"])
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    x = torch.randn(4, 16, device=device)
+    for _ in range(3):
+        model(x).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+    with torch.no_grad():
+        ref_output = model(x).clone()
+
+    save_checkpoint(
+        shared_tmp_dir,
+        models=model,
+        optimizer=optimizer,
+        epoch=2,
+        optimizer_model=model,
+    )
+    dist.barrier()
+
+    torch.manual_seed(0)
+    model2 = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 16)).to(device)
+    fully_shard(model2, mesh=mesh["world"])
+    optimizer2 = torch.optim.Adam(model2.parameters(), lr=1e-3)
+
+    epoch = load_checkpoint(
+        shared_tmp_dir,
+        models=model2,
+        optimizer=optimizer2,
+        optimizer_model=model2,
+    )
+    assert epoch == 2
+
+    with torch.no_grad():
+        loaded_output = model2(x)
+    assert torch.allclose(ref_output, loaded_output, rtol=1e-5, atol=1e-5), (
+        "Model outputs differ after nn.Module FSDP2 checkpoint round-trip"
+    )
+
+
+# ---------------------------------------------------------------------------
+# FSDP2 — channels_last optimizer state round-trip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.multigpu_static
+@pytest.mark.parametrize(
+    "memory_format",
+    [
+        pytest.param(torch.channels_last, id="channels_last"),
+        pytest.param(torch.contiguous_format, id="contiguous"),
+    ],
+)
+def test_fsdp2_channels_last_optim_roundtrip(shared_tmp_dir, memory_format):
+    """Optimizer state survives an FSDP2 checkpoint round-trip with Conv2d weights.
+
+    FSDP2 has no FlatParameter optim asymmetry (``_remap_channels_last_optim_sd``
+    is a no-op), but we still verify optimizer state round-trips correctly for
+    models trained with ``channels_last`` activations/params.
+    """
+    torch.manual_seed(0)
+    dm = DistributedManager()
+    if dm.world_size < 2:
+        pytest.skip("Need at least 2 ranks")
+
+    device = dm.device
+    mesh = init_device_mesh("cuda", (dm.world_size,), mesh_dim_names=("world",))
+
+    def _build_model():
+        m = nn.Sequential(
+            nn.Conv2d(3, 8, kernel_size=3, padding=1),
+            nn.Flatten(),
+            nn.Linear(8 * 4 * 4, 8),
+        ).to(device, memory_format=memory_format)
+        _contiguous_params_for_fsdp2(m)
+        fully_shard(m, mesh=mesh["world"])
+        return m
+
+    model = _build_model()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    x = torch.randn(2, 3, 4, 4, device=device).to(memory_format=memory_format)
+    for _ in range(3):
+        model(x).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+    full_options = StateDictOptions(full_state_dict=True)
+    ref_optim_sd = get_optimizer_state_dict(model, optimizer, options=full_options)
+
+    save_checkpoint(
+        shared_tmp_dir,
+        models=model,
+        optimizer=optimizer,
+        epoch=3,
+        optimizer_model=model,
+    )
+    dist.barrier()
+
+    model2 = _build_model()
+    optimizer2 = torch.optim.Adam(model2.parameters(), lr=1e-3)
+    epoch = load_checkpoint(
+        shared_tmp_dir,
+        models=model2,
+        optimizer=optimizer2,
+        optimizer_model=model2,
+    )
+    assert epoch == 3
+
+    loaded_optim_sd = get_optimizer_state_dict(model2, optimizer2, options=full_options)
+
+    if dm.rank == 0:
+        assert ref_optim_sd["state"].keys() == loaded_optim_sd["state"].keys()
+        for pname, pstate in ref_optim_sd["state"].items():
+            for k, ref_v in pstate.items():
+                loaded_v = loaded_optim_sd["state"][pname][k]
+                if not isinstance(ref_v, torch.Tensor):
+                    assert ref_v == loaded_v, (
+                        f"Optimizer state {pname}.{k} differs: {ref_v} vs {loaded_v}"
+                    )
+                    continue
+                assert torch.equal(ref_v.cpu(), loaded_v.cpu()), (
+                    f"Optimizer state {pname}.{k} differs after FSDP2 round-trip"
+                )
