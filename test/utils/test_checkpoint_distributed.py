@@ -565,9 +565,7 @@ def _build_fsdp2_shard_tensor_model(
     embed_tokens: int = 24,
 ) -> _PosEmbedModel:
     """Build a 2-D mesh model: domain DTensor params + FSDP2 on ddp."""
-    model = _PosEmbedModel(embed_tokens=embed_tokens, embed_dim=8, hidden=16).to(
-        device
-    )
+    model = _PosEmbedModel(embed_tokens=embed_tokens, embed_dim=8, hidden=16).to(device)
     model = distribute_module(
         model, device_mesh=mesh["domain"], partition_fn=_partition_pos_embed
     )
