@@ -66,10 +66,14 @@ checkpoint_logging = PythonLogger("checkpoint")
 # Distributed-model detection helpers
 # ---------------------------------------------------------------------------
 
-
 def _is_distributed_model(model: torch.nn.Module) -> bool:
-    """Return ``True`` when *model* is FSDP-wrapped or has DTensor params.
-    FSDP: FSDP1, FSDPModule: FSDP2 (fully_shard)
+    """
+    A simple helper function to determine whether to save/load using DCP or not.
+
+    Return ``True`` when *model* is FSDP-wrapped or has DTensor params. 
+    FSDP: FSDP1
+    FSDPModule: FSDP2 (fully_shard)
+    
     """
     if isinstance(model, (FSDP, FSDPModule)):
         return True
@@ -79,7 +83,9 @@ def _is_distributed_model(model: torch.nn.Module) -> bool:
 def _unwrap_ddp_compile(
     model: torch.nn.Module, loading: bool = False
 ) -> torch.nn.Module:
-    """Strip DDP / DataParallel / ``torch.compile`` wrappers, keep FSDP."""
+    """
+    Strip DDP / DataParallel / ``torch.compile`` wrappers, keep FSDP.
+    """
     if isinstance(
         model,
         (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel),
@@ -96,21 +102,22 @@ def _unwrap_ddp_compile(
 
 
 def _unwrap_fsdp(model: torch.nn.Module) -> torch.nn.Module:
-    """Unwrap one FSDP layer (if present) to reach the user module."""
+    """
+    Unwrap one FSDP layer (if present) to reach the user module.
+    FSDP1 only.
+    """
     if isinstance(model, FSDP):
         return model.module
     return model
 
 
 def _unwrapped_class_name(model: torch.nn.Module) -> str:
-    """Return the user-facing class name, peeling FSDP1/FSDP2 wrappers.
+    """
+    Return the user-facing class name, peeling FSDP1/FSDP2 wrappers.
 
     FSDP2's ``fully_shard`` rebinds ``model.__class__`` to a dynamically
     generated ``FSDP{ClassName}`` subclass with bases ``(FSDPModule, original_cls)``.
-    Stripping the prefix isn't reliable because user classes may legitimately
-    start with ``FSDP``; instead we walk the MRO and return the first class
-    that is not ``FSDPModule`` and not a generic ``torch.nn.Module`` base.
-
+    
     Without this fix, saving an FSDP2-wrapped model produces a ``.mdlus``
     file named after the synthetic class (e.g. ``FSDPFullyConnected.mdlus``)
     instead of the original (``FullyConnected.mdlus``).
@@ -793,14 +800,12 @@ def _unique_model_names(
     models: list[torch.nn.Module],
     loading: bool = False,
 ) -> dict[str, torch.nn.Module]:
-    r"""Map a list of models to unique names derived from their class names.
+    """
+    Map a list of models to unique names derived from their class names.
 
     DDP and ``torch.compile`` wrappers are stripped, but FSDP wrappers are
     preserved so that the returned modules can be passed to PyTorch's DCP
     state-dict helpers when needed.
-
-    When multiple models share a class name a numeric suffix is appended
-    (e.g. ``"MyModel0"``, ``"MyModel1"``).
 
     Parameters
     ----------
