@@ -1407,10 +1407,15 @@ def _load_checkpoint_distributed(
         optim_sd = checkpoint_dict.get("optimizer_state_dict", {}) if is_rank0 else {}
         if opt_model is not None and _is_distributed_model(opt_model):
             dtensor_plc = _get_dtensor_param_placements(opt_model)
-            if _needs_dcp_broadcast_bypass(opt_model, dtensor_plc):
+            if isinstance(opt_model, FSDPModule) and _needs_dcp_broadcast_bypass(
+                opt_model, dtensor_plc
+            ):
+                # FSDP2 with a degenerate mesh axis (e.g. ddp=1, domain=2):
+                # broadcast_from_rank0 hangs on degenerate axes, so broadcast
+                # manually and use full_state_dict=True (no broadcast_from_rank0).
                 osd_list: list[Any] = [optim_sd]
                 torch.distributed.broadcast_object_list(osd_list, src=0)
-                optim_sd = _redistribute_optim_sd_for_dtensor(dtensor_plc, osd_list[0])
+                optim_sd = osd_list[0]
                 optim_sd = _remap_channels_last_optim_sd(opt_model, optim_sd)
                 # Pre-populate live optimizer ``state[p]`` so DCP's
                 # flatten/unflatten round-trip has the ``state.X.*`` keys
@@ -1426,12 +1431,18 @@ def _load_checkpoint_distributed(
                     opt_model, optimizer, optim_sd, options=full_options
                 )
             elif isinstance(opt_model, FSDPModule):
-                # FSDP2: broadcast_from_rank0 hangs for optimizer state on
-                # multi-rank meshes.  Broadcast explicitly and load with
-                # full_state_dict=True on all ranks.
+                # FSDP2 with a fully non-degenerate mesh (e.g. ddp=2, domain=2):
+                # use broadcast_from_rank0 which redistributes shards correctly.
+                optim_sd = _remap_channels_last_optim_sd(opt_model, optim_sd)
+                set_optimizer_state_dict(
+                    opt_model, optimizer, optim_sd, options=broadcast_options
+                )
+            elif _needs_dcp_broadcast_bypass(opt_model, dtensor_plc):
+                # FSDP1 NO_SHARD / plain DTensor: redistribute full tensors to
+                # per-rank local shards before loading.
                 osd_list = [optim_sd]
                 torch.distributed.broadcast_object_list(osd_list, src=0)
-                optim_sd = osd_list[0]
+                optim_sd = _redistribute_optim_sd_for_dtensor(dtensor_plc, osd_list[0])
                 optim_sd = _remap_channels_last_optim_sd(opt_model, optim_sd)
                 _materialize_optimizer_state_for_dcp(
                     optimizer, optim_sd.get("state", {})

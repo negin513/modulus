@@ -17,12 +17,14 @@
 """Domain parallelization utilities."""
 
 from collections.abc import Iterator, Mapping
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
 from datasets.dataset import worker_init
 from torch.distributed.fsdp import FSDPModule, fully_shard
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.tensor import DTensor, distribute_module, distribute_tensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from utils.nn import nested_to
