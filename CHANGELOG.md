@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- FSDP2 checkpoint support: full save/load round-trip for
+  ``torch.distributed.fsdp`` v2 models, including DTensor edge cases,
+  cross-mesh reloads, and optimizer state loading.
+- Migrated the StormCast example from DDP + Domain Parallel  to FSDP2 +
+  Domain Parallel. StormCast previously used ``FullyShardedDataParallel``
+  with ``ShardingStrategy.NO_SHARD`` (equivalent to DDP) alongside domain
+  parallelism; it now uses the FSDP2 ``fully_shard`` API, producing 2D-mesh
+  DTensor parameters when ``use_shard_tensor`` is enabled.
 - Adds radiation transport example (`examples/nuclear_engineering/radiation_transport`)
 - Adds agent skills structure, and initial skill for 'discoverability'.
 - Adds xDeepONet to experimental models
