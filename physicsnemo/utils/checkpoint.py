@@ -1521,7 +1521,13 @@ def get_checkpoint_dir(base_dir: Path | str, model_name: str) -> str:
 
 def _cache_if_needed(path: str) -> str:
     """
-    For remote fsspec URIs, downloads to a local cache and returns the local path.
+
+    Return a local path for ``path``, downloading to cache if remote.
+    
+    For the ``"file"`` protocol the path is returned unchanged.  For remote
+    protocols the file is fetched via
+    :func:`~physicsnemo.core.filesystem._download_cached` into a
+    process-specific cache directory.
 
 
     Parameters
