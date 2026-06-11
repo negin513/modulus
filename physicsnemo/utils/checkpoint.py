@@ -678,12 +678,14 @@ def _unique_model_names(
     models: list[torch.nn.Module],
     loading: bool = False,
 ) -> dict[str, torch.nn.Module]:
-    """
-    Map a list of models to unique names derived from their class names.
+    r"""Map a list of models to unique names derived from their class names.
 
     DDP and ``torch.compile`` wrappers are stripped, but FSDP wrappers are
     preserved so that the returned modules can be passed to PyTorch's DCP
     state-dict helpers when needed.
+
+    When multiple models share a class name a numeric suffix is appended
+    (e.g. ``"MyModel0"``, ``"MyModel1"``).
 
     Parameters
     ----------
