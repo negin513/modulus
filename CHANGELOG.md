@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with ``ShardingStrategy.NO_SHARD`` (equivalent to DDP) alongside domain
   parallelism; it now uses the FSDP2 ``fully_shard`` API, producing 2D-mesh
   DTensor parameters when ``use_shard_tensor`` is enabled.
+- Adds `farthest_point_sampling` to `physicsnemo.nn.functional`, a greedy
+  farthest-point sampling (FPS) functional for point clouds.
+- Adds `FourierPositionalEmbedding` to `physicsnemo.nn`, a deterministic
+  axis-wise (NeRF-style) Fourier positional embedding for continuous
+  coordinates with no learnable parameters.
 - Adds radiation transport example (`examples/nuclear_engineering/radiation_transport`)
 - Adds agent skills structure, and initial skill for 'discoverability'.
 - Adds xDeepONet to experimental models
