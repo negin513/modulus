@@ -15,11 +15,22 @@
 # limitations under the License.
 
 # Dataset root directories.
-# Fill in the paths below to point to your local dataset locations.
-# Use ??? as a placeholder for paths you have not yet configured.
-# OmegaConf will raise MissingMandatoryValue at runtime for any
-# path that is still ???.
+#
+# Each entry resolves from an environment variable so the same recipe
+# checkout can drive multiple cluster layouts (Lustre, NVMe stage-in,
+# laptop) without mutating this file.  If the env var is unset the value
+# stays MISSING (`???`) and OmegaConf raises MissingMandatoryValue at
+# runtime, which fails fast with a clear message.
+#
+# Set the corresponding env var before launching `src/train.py`, e.g.:
+#   export DATASET_PATH_DRIVAER_ML=/lustre/fs1/.../PhysicsNeMo-DrivaerML
+#
+# `benchmarks/run_benchmark.sbatch` exports these automatically based on
+# the matrix entry's STORAGE_MODE (Lustre path or NVMe stage-in dir).
 
-drivaer_ml: ???
-highlift_aero_ml: ???
-shift_suv: ???
+drivaer_ml:       ${oc.env:DATASET_PATH_DRIVAER_ML, ???}
+highlift_aero_ml: ${oc.env:DATASET_PATH_HIGHLIFT_AERO_ML, ???}
+shift_suv:        ${oc.env:DATASET_PATH_SHIFT_SUV, ???}
+# DriveSim is awaiting Muhammad's confirmation on path / format / field names.
+# See datasets/drivesim_volume.yaml for the stub pipeline that consumes this.
+drivesim:         ${oc.env:DATASET_PATH_DRIVESIM, ???}

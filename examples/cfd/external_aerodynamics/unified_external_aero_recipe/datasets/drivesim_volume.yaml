@@ -14,30 +14,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# DrivaerML volume dataset (DomainMesh)
-# Loads domain_*.pmsh files containing interior volume mesh + vehicle boundary + global_data.
-# Interior: tetrahedral volume mesh with fields in point_data.
-# Boundary: triangulated car-body surface mesh keyed `vehicle` (curated layout).
-# global_data: freestream conditions (U_inf, rho_inf, p_inf, nu, L_ref) are
-# embedded directly in the .pmsh files and read straight out of each sample's
-# global_data by NonDimensionalizeByMetadata.
-# Splits are controlled by manifest.json + train_split/val_split in the training config.
+# DriveSim volume dataset (DomainMesh) -- STUB AWAITING MUHAMMAD
+# ---------------------------------------------------------------
+# This file is a placeholder shape that mirrors drivaer_ml_volume.yaml so
+# the unified recipe can compose a CLI invocation `model=geotransolver_volume
+# dataset=drivesim_volume` end-to-end as soon as `dataset_paths.drivesim` is
+# pointed at a real directory.  Until then, OmegaConf will raise
+# `MissingMandatoryValue` on the `???` placeholder in dataset_paths.yaml so
+# the run fails fast with a clear error.
+#
+# Confirm with Muhammad before flipping this on:
+#   * Path on Lustre (group HSG mount)
+#   * File format -- is it the curated `.pdmsh` DomainMesh layout, or raw
+#     VTK / .vtu / OpenFOAM that needs PhysicsNeMo-Curator preprocessing?
+#   * Field names (the rename + nondim blocks below currently assume the
+#     DrivAerML naming convention -- UMeanTrim / pMeanTrim / nutMeanTrim)
+#   * Whether a sibling `*_single_solid.stl.pmsh` boundary exists for SDF
+#     computation
+#   * Recommended subsampling resolution given the source mesh size
+#   * Whether DriveSim has a manifest.json next to the data dir, or uses
+#     directory-mode train/val splits
 
-train_datadir: ${dataset_paths.drivaer_ml}
+train_datadir: ${dataset_paths.drivesim}
 
 pipeline:
   reader:
     _target_: ${dp:DomainMeshReader}
     path: ${train_datadir}
-    # Restrict to top-level run_* directories so we skip the
-    # `.cache/huggingface/upload/run_*/domain_*.pdmsh/...` upload-tracking
-    # skeleton tree that huggingface_hub leaves behind.
-    pattern: "run_*/domain_*.pdmsh"
+    pattern: "**/domain_*.pdmsh"   # TODO confirm with Muhammad
     subsample_n_points: ${sampling_resolution}
     subsample_n_cells: ${sampling_resolution}
     extra_boundaries:
       stl_geometry:
-        pattern: "*_single_solid.stl.pmsh"
+        pattern: "*_single_solid.stl.pmsh"   # TODO confirm with Muhammad
   augmentations:
     - _target_: ${dp:RandomRotateMesh}
       axes: ["z"]
@@ -53,6 +62,9 @@ pipeline:
       global_data: [TimeValue]
     - _target_: ${dp:CenterMesh}
       use_area_weighting: false
+    # NOTE: Field name mappings mirror DrivAerML.  Muhammad to confirm
+    # whether DriveSim uses the same trim-mean naming convention or
+    # something else (e.g. ensemble means, direct U/p fields).
     - _target_: ${dp:NonDimensionalizeByMetadata}
       fields:
         UMeanTrim: velocity
@@ -75,13 +87,9 @@ pipeline:
       association: point_data
       fields:
         nut: {type: scalar, mean: 4.8e-4, std: 9.4e-4}
-    # No terminal MeshToTensorDict / RestructureTensorDict: the volume YAML
-    # already produces a DomainMesh natively (interior = volume mesh with
-    # target fields in point_data; boundaries = {"vehicle": car body}).
-    # The recipe's collate consumes the DomainMesh directly using each
-    # model YAML's `forward_kwargs:` spec. Targets are extracted from
-    # interior.point_data.<name> by the `targets:` block below.
 
+# Same target shape as DrivAerML volume so the GeoTransolver volume model
+# template's out_dim auto-derivation works without per-dataset patching.
 targets:
   velocity: vector
   pressure: scalar

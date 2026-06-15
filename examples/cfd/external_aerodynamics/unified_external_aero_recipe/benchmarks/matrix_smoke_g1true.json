@@ -1,0 +1,17 @@
+[
+  {
+    "run_id": "smoke__geotransolver_surface__drivaer_ml_surface__g1true__lustre__sub10000",
+    "model": "geotransolver_surface",
+    "dataset": "drivaer_ml_surface",
+    "num_gpus": 1,
+    "nodes": 1,
+    "storage": "lustre",
+    "sampling_resolution": 10000,
+    "phase": 0,
+    "skip": false,
+    "skip_reason": null,
+    "results_dir": "/lustre/fs1/portfolios/coreai/projects/coreai_modulus_cae/users/nsobhani/workdir/physicsnemo_cae_benchmark/examples/cfd/external_aerodynamics/unified_external_aero_recipe/results_smoke_g1true/geotransolver_surface/drivaer_ml_surface/gpus_1/lustre/sub_10000",
+    "est_walltime_min": 10,
+    "extra_overrides": []
+  }
+]

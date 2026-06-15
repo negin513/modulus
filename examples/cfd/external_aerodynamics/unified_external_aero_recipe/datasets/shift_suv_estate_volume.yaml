@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# SHIFT SUV Estate volume dataset (DomainMesh)
+# Each run directory contains domain.pdmsh (interior volume + vehicle boundary)
+# and merged_surfaces_filled.stl.pmsh for SDF geometry.
+# Interior point_data: velocity_average, pressure_average.
+# global_data: U_inf, p_inf, rho_inf, nu, L_ref on the DomainMesh.
+
+train_datadir: ${dataset_paths.shift_suv}/estate/
+
+pipeline:
+  reader:
+    _target_: ${dp:DomainMeshReader}
+    path: ${train_datadir}
+    pattern: "run_*/domain.pdmsh"
+    subsample_n_points: ${sampling_resolution}
+    subsample_n_cells: ${sampling_resolution}
+    extra_boundaries:
+      stl_geometry:
+        pattern: "merged_surfaces_filled.stl.pmsh"
+  augmentations:
+    - _target_: ${dp:RandomRotateMesh}
+      axes: ["z"]
+      transform_point_data: true
+      transform_global_data: true
+    - _target_: ${dp:RandomTranslateMesh}
+      distribution:
+        _target_: torch.distributions.Uniform
+        low: [-1.0, -1.0, 0.0]
+        high: [1.0, 1.0, 0.0]
+  transforms:
+    - _target_: ${dp:CenterMesh}
+      use_area_weighting: false
+    - _target_: ${dp:NonDimensionalizeByMetadata}
+      fields:
+        velocity_average: velocity
+        pressure_average: pressure
+      association: point_data
+    - _target_: ${dp:ComputeSDFFromBoundary}
+      boundary_name: stl_geometry
+      sdf_field: sdf
+      normals_field: sdf_normals
+      use_winding_number: true
+    - _target_: ${dp:DropBoundary}
+      names: [stl_geometry]
+    - _target_: ${dp:RenameMeshFields}
+      point_data:
+        velocity_average: velocity
+        pressure_average: pressure
+
+targets:
+  velocity: vector
+  pressure: scalar

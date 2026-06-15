@@ -31,7 +31,12 @@ pipeline:
   reader:
     _target_: ${dp:MeshReaderWithGlobalData}
     path: ${train_datadir}
-    pattern: "**/*.pdmsh/_tensordict/boundaries/vehicle"
+    # Restrict to top-level run_* directories so we skip the
+    # `.cache/huggingface/upload/run_*/...pdmsh/...` upload-tracking
+    # skeleton tree that huggingface_hub leaves behind.  That tree
+    # mirrors the real layout but contains only .metadata/.lock
+    # placeholders, and the dataloader fails on the missing meta.json.
+    pattern: "run_*/*.pdmsh/_tensordict/boundaries/vehicle"
     subsample_n_cells: ${sampling_resolution}
     # Walk up two levels from the boundary tensordict to the parent
     # DomainMesh's global_data and merge its keys onto each sample.

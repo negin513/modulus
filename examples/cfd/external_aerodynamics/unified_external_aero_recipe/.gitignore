@@ -1,4 +1,5 @@
 *.sh
+!benchmarks/*.sh
 runs/
 mlruns/
 *.err
@@ -9,3 +10,16 @@ checkpoints/
 *.mdlus
 *.tfevents*
 *.parquet
+
+# Benchmark run artifacts (sources live under benchmarks/)
+results/
+benchmarks/matrix_*.json
+!benchmarks/matrix_smoke_g1true.json
+benchmarks/submitted_jobs*.tsv
+benchmarks/groups/
+benchmarks/watch_scaling.*
+benchmarks/slurm-*.out
+benchmarks/slurm-*.err
+benchmarks/__pycache__/
+benchmarks/**/*.pyc
+benchmarks/MUHAMMAD_SLACK_DRAFT.md
