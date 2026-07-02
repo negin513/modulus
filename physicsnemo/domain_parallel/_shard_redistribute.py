@@ -255,11 +255,9 @@ def _to_new_shard_dim(
     ):
         current_shapes_by_rank = current_spec._sharding_shapes[mesh_dim]
         my_coord = device_mesh.get_coordinate()[mesh_dim]
-        is_fresh = len(
-            current_shapes_by_rank
-        ) == mesh_size and torch.Size(current_shapes_by_rank[my_coord]) == torch.Size(
-            local_tensor.shape
-        )
+        is_fresh = len(current_shapes_by_rank) == mesh_size and torch.Size(
+            current_shapes_by_rank[my_coord]
+        ) == torch.Size(local_tensor.shape)
         if is_fresh:
             my_target_chunk_size = chunks[my_coord].shape[target_dim]
             recv_shapes = []
