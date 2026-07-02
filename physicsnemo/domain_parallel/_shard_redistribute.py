@@ -232,21 +232,60 @@ def _to_new_shard_dim(
     # Also, cast to list for all_to_all:
     chunks = [c.contiguous() for c in chunks]
 
-    # TODO - remove this all_to_all by enabling recv shape from known information.
+    # Try to compute recv shapes analytically, with no communication:
+    # - the target-dim chunk size we're about to receive is whatever *we*
+    #   compute for our own slot, since every rank derives its chunk sizes
+    #   from the same (already-replicated) global extent via the same
+    #   deterministic chunking rule -- it's not actually rank-dependent.
+    # - the current-dim extent of the sender is already recorded per-rank
+    #   on `current_spec`, as long as it was built with known
+    #   (non-"infer") sharding shapes.
+    # Only fall back to the shape-negotiation all_to_all when that
+    # information genuinely isn't available without a collective, or when
+    # it might be stale: `current_spec` is fixed for the whole (possibly
+    # multi-hop) redistribute call, but `local_tensor` can already have been
+    # reshaped by an earlier hop in the same call (e.g. a 2D-mesh
+    # Shard/Shard -> Shard/Replicate redistribute first gathers one mesh
+    # dim, then transposes the other) -- in that case the recorded shapes
+    # no longer describe what's actually being sent.
+    recv_shapes = None
+    if (
+        current_spec._sharding_shapes is not None
+        and mesh_dim in current_spec._sharding_shapes
+    ):
+        current_shapes_by_rank = current_spec._sharding_shapes[mesh_dim]
+        my_coord = device_mesh.get_coordinate()[mesh_dim]
+        is_fresh = len(
+            current_shapes_by_rank
+        ) == mesh_size and torch.Size(current_shapes_by_rank[my_coord]) == torch.Size(
+            local_tensor.shape
+        )
+        if is_fresh:
+            my_target_chunk_size = chunks[my_coord].shape[target_dim]
+            recv_shapes = []
+            for sender_shape in current_shapes_by_rank:
+                if len(sender_shape) != local_tensor.ndim:
+                    recv_shapes = None
+                    break
+                recv_shape = list(sender_shape)
+                recv_shape[target_dim] = my_target_chunk_size
+                recv_shapes.append(recv_shape)
 
-    send_shapes = [
-        torch.tensor(c.shape, device=local_tensor.device, dtype=torch.int32)
-        for c in chunks
-    ]
-    recv_shapes = [torch.empty_like(s) for s in send_shapes]
+    if recv_shapes is None:
+        # Fallback: negotiate recv shapes with the sender ranks directly.
+        send_shapes = [
+            torch.tensor(c.shape, device=local_tensor.device, dtype=torch.int32)
+            for c in chunks
+        ]
+        recv_shape_tensors = [torch.empty_like(s) for s in send_shapes]
 
-    # Gather the send shape from every rank:
-    # For all to all, we _have_ to send and receive from every rank.
-    # But we can optimize the null-communication
-    dist.all_to_all(recv_shapes, send_shapes, group=group)
+        # Gather the send shape from every rank:
+        # For all to all, we _have_ to send and receive from every rank.
+        # But we can optimize the null-communication
+        dist.all_to_all(recv_shape_tensors, send_shapes, group=group)
 
-    # Turn the recv_shapes back into torch shapes:
-    recv_shapes = [list(torch.Size(r)) for r in recv_shapes]
+        # Turn the recv_shapes back into torch shapes:
+        recv_shapes = [list(torch.Size(r)) for r in recv_shape_tensors]
 
     # Create the buffers for recv:
     recv_buffers = [
