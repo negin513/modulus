@@ -171,6 +171,7 @@ def _select_slice_from_replicate(
 
 def _to_new_shard_dim(
     local_tensor: torch.Tensor,
+    current_spec: ShardTensorSpec,
     target_spec: ShardTensorSpec,
     mesh_dim: int,
     size_hint: tuple[int, ...] | None,
@@ -187,6 +188,8 @@ def _to_new_shard_dim(
     ----------
     local_tensor : torch.Tensor
         The local shard of the tensor to reshard.
+    current_spec : ShardTensorSpec
+        Specification of current sharding scheme.
     target_spec : ShardTensorSpec
         Specification of target sharding scheme.
     mesh_dim : int
@@ -430,6 +433,7 @@ def redistribute_local_shard_tensor(
 
                     new_local_tensor, size_hint = _to_new_shard_dim(
                         local_tensor,
+                        current_spec,  # Known per-rank shapes, to avoid negotiating recv sizes.
                         target_spec,  # Send the whole spec so we can infer full recv sizes.
                         i,  # The mesh dim we're transposing sharding on.
                         size_hint,
