@@ -243,7 +243,9 @@ jobs:
         # matters most. The threshold is now enforced by its own step below.
         uv run --no-sync coverage report -i --show-missing --omit="*test*" --omit="*internal*" --omit="*experimental*"
         uv run --no-sync coverage html -i
-        uv run --no-sync coverage xml -i -o coverage.xml
+        # xml carries the same omits as report/json so the number Codecov
+        # publishes agrees with the "Coverage %" check and the gate below.
+        uv run --no-sync coverage xml -i -o coverage.xml --omit="*test*" --omit="*internal*" --omit="*experimental*"
         uv run --no-sync coverage json -i -o coverage.json --omit="*test*" --omit="*internal*" --omit="*experimental*"
 
     - name: Upload coverage HTML report
@@ -252,6 +254,20 @@ jobs:
         name: coverage-report-pr
         path: htmlcov/
         retention-days: 7
+
+    - name: Upload coverage to Codecov
+      if: ${{ !cancelled() }}
+      # Best-effort (NVIDIA/warp's pattern): inert until an admin installs
+      # the Codecov GitHub App and provisions the CODECOV_TOKEN secret, and
+      # never fails the job on upload errors. Behavior config: codecov.yml
+      # at the repo root. Dashboard: app.codecov.io/gh/NVIDIA/physicsnemo
+      continue-on-error: true
+      uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2  # v6.0.0
+      with:
+        disable_search: true
+        files: ./coverage.xml
+        flags: pr-core
+        token: ${{ secrets.CODECOV_TOKEN }}
 
     - name: Report coverage percentage on the PR
       if: always()

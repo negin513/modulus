@@ -365,8 +365,10 @@ jobs:
         # The threshold is enforced by its own final step instead.
         uv run --no-sync coverage report -i --show-missing --omit="*test*" --omit="*internal*" --omit="*experimental*"
         uv run --no-sync coverage html -i
-        # Also create an XML report for potential CI integrations
-        uv run --no-sync coverage xml -i -o coverage.xml
+        # xml carries the same omits as the report so the number Codecov
+        # publishes agrees with the enforced threshold (lockstep with
+        # github-pr.yml).
+        uv run --no-sync coverage xml -i -o coverage.xml --omit="*test*" --omit="*internal*" --omit="*experimental*"
 
     - name: Upload coverage HTML report
       uses: actions/upload-artifact@v4
@@ -383,6 +385,20 @@ jobs:
           .coverage
           coverage.xml
         retention-days: 30
+
+    - name: Upload coverage to Codecov
+      if: ${{ !cancelled() }}
+      # Best-effort and inert until CODECOV_TOKEN is provisioned (see
+      # github-pr.yml). The nightly runs the full suite, so this flag is
+      # the meaningful trend line on the dashboard; the PR job's
+      # `pr-core` flag is the testmon-selected subset.
+      continue-on-error: true
+      uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2  # v6.0.0
+      with:
+        disable_search: true
+        files: ./coverage.xml
+        flags: nightly-full
+        token: ${{ secrets.CODECOV_TOKEN }}
 
     - name: Enforce coverage threshold
       run: |
